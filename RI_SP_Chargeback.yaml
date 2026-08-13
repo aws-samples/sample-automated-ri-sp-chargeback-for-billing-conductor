@@ -1,0 +1,705 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Proportional RI/SP Chargeback with AWS Billing Conductor.
+  Deploys Lambda functions, IAM roles, S3 audit bucket, SSM parameter,
+  Athena named query, and EventBridge schedule for automated monthly chargeback processing.
+
+# ═══════════════════════════════════════════════════════════════════
+# Parameters
+# ═══════════════════════════════════════════════════════════════════
+Parameters:
+  PayerAccountId:
+    Type: String
+    Description: >-
+      The AWS payer (management) account ID that holds RI/SP commitments.
+      This account is excluded from chargeback credits.
+    AllowedPattern: '^[0-9]{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID.
+
+  AthenaDatabase:
+    Type: String
+    Default: cur2
+    Description: >-
+      Athena database name where the CUR 2.0 data is catalogued.
+
+  AthenaTable:
+    Type: String
+    Default: data
+    Description: >-
+      Athena table name for CUR 2.0 data within the specified database.
+
+  BillingPeriod:
+    Type: String
+    Default: '2026-02:'
+    Description: >-
+      Billing period value as it appears in CUR 2.0 partition (YYYY-MM: format with colon).
+
+  EnableSchedule:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Enable or disable the EventBridge scheduled rule. Set to true to activate
+      the monthly 5th-of-month trigger for Lambda 1.
+
+  DryRun:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      When true, Lambda 2 simulates credit creation without calling the
+      Billing Conductor CreateCustomLineItem API. Use for first-run validation.
+
+  CURBucketName:
+    Type: String
+    Description: >-
+      S3 bucket name where CUR 2.0 data is stored (for Athena to read).
+    Default: ''
+
+# ═══════════════════════════════════════════════════════════════════
+# Conditions
+# ═══════════════════════════════════════════════════════════════════
+Conditions:
+  ScheduleEnabled: !Equals [!Ref EnableSchedule, 'true']
+
+# ═══════════════════════════════════════════════════════════════════
+# Resources
+# ═══════════════════════════════════════════════════════════════════
+Resources:
+
+  # ─────────────────────────────────────────────────────────────────
+  # S3 Bucket — Audit Logs
+  # ─────────────────────────────────────────────────────────────────
+  AuditBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'risp-chargeback-audit-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAuditLogsAfter365Days
+            Status: Enabled
+            ExpirationInDays: 365
+      Tags:
+        - Key: Project
+          Value: RISP-Chargeback
+        - Key: Purpose
+          Value: AuditLogs
+
+  # ─────────────────────────────────────────────────────────────────
+  # SSM Parameter — Account-to-BillingGroup Map (placeholder)
+  # ─────────────────────────────────────────────────────────────────
+  AccountBillingGroupMapParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /chargeback/account-billing-group-map
+      Type: String
+      Value: '{}'
+      Description: >-
+        Account-to-BillingGroup mapping populated by BillingGroupMappingFunction (Lambda 1).
+        Format: JSON object {"account_id": "billing_group_arn", ...}
+      Tags:
+        Project: RISP-Chargeback
+
+  # ─────────────────────────────────────────────────────────────────
+  # IAM Role — Lambda 1 (Billing Group Mapping)
+  # ─────────────────────────────────────────────────────────────────
+  BillingGroupMappingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'RISPChargeback-BillingGroupMapping-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BillingGroupMappingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BillingConductorReadAccess
+                Effect: Allow
+                Action:
+                  - billingconductor:ListBillingGroups
+                  - billingconductor:ListAccountAssociations
+                Resource: '*'
+              - Sid: OrganizationsReadAccess
+                Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                Resource: '*'
+              - Sid: SSMWriteAccess
+                Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/chargeback/account-billing-group-map'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: RISP-Chargeback
+
+  # ─────────────────────────────────────────────────────────────────
+  # IAM Role — Lambda 2 (Apply RI/SP Credits)
+  # ─────────────────────────────────────────────────────────────────
+  ApplyRISPCreditsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'RISPChargeback-ApplyCredits-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ApplyRISPCreditsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BillingConductorWriteAccess
+                Effect: Allow
+                Action:
+                  - billingconductor:CreateCustomLineItem
+                Resource: '*'
+              - Sid: SSMReadAccess
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/chargeback/account-billing-group-map'
+              - Sid: S3AuditAccess
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt AuditBucket.Arn
+                  - !Sub '${AuditBucket.Arn}/*'
+              - Sid: AthenaQueryAccess
+                Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource: '*'
+              - Sid: GlueCatalogAccess
+                Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetDatabase
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${AthenaDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${AthenaDatabase}/${AthenaTable}'
+              - Sid: CURBucketReadAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${CURBucketName}'
+                  - !Sub 'arn:aws:s3:::${CURBucketName}/*'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: RISP-Chargeback
+
+  # ─────────────────────────────────────────────────────────────────
+  # Lambda Function 1 — Billing Group Mapping
+  # ─────────────────────────────────────────────────────────────────
+  BillingGroupMappingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'RISPChargeback-BillingGroupMapping-${AWS::StackName}'
+      Description: >-
+        Step 6.1 — Builds account-to-billing-group mapping from AWS Billing Conductor
+        and stores it in SSM Parameter Store for downstream processing.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt BillingGroupMappingRole.Arn
+      Environment:
+        Variables:
+          PAYER_ACCOUNT_ID: !Ref PayerAccountId
+          SSM_PARAM_NAME: /chargeback/account-billing-group-map
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import os
+          from typing import Tuple
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          PAYER_ACCOUNT_ID = os.environ['PAYER_ACCOUNT_ID']
+          SSM_PARAM_NAME   = os.environ.get('SSM_PARAM_NAME', '/chargeback/account-billing-group-map')
+          REGION           = os.environ.get('AWS_REGION', 'us-east-1')
+
+
+          def lambda_handler(event, context):
+              logger.info("Starting account-to-billing-group mapping")
+              try:
+                  account_map, group_count = build_account_map()
+                  store_map_in_ssm(account_map)
+                  result = {
+                      "status": "SUCCESS",
+                      "account_map": account_map,
+                      "total_accounts": len(account_map),
+                      "total_billing_groups": group_count
+                  }
+                  logger.info(f"Mapping complete: {len(account_map)} accounts across {group_count} billing groups")
+                  return result
+              except Exception as e:
+                  logger.error(f"Failed to build account map: {str(e)}", exc_info=True)
+                  raise
+
+
+          def build_account_map() -> Tuple[dict, int]:
+              bc = boto3.client('billingconductor', region_name='us-east-1')
+              account_map = {}
+              group_count = 0
+
+              bg_paginator = bc.get_paginator('list_billing_groups')
+              for bg_page in bg_paginator.paginate():
+                  for group in bg_page.get('BillingGroups', []):
+                      group_arn = group['Arn']
+                      group_name = group.get('Name', 'Unknown')
+                      group_count += 1
+                      logger.info(f"Processing billing group: {group_name} ({group_arn})")
+
+                      response = bc.list_account_associations(Filters={'Association': group_arn})
+                      for account in response.get('LinkedAccounts', []):
+                          acct_id = account['AccountId']
+                          if acct_id == PAYER_ACCOUNT_ID:
+                              continue
+                          if acct_id in account_map:
+                              logger.warning(f"Account {acct_id} in multiple billing groups. Overwriting.")
+                          account_map[acct_id] = group_arn
+
+              return account_map, group_count
+
+
+          def store_map_in_ssm(account_map: dict):
+              ssm = boto3.client('ssm', region_name=REGION)
+              try:
+                  ssm.put_parameter(
+                      Name=SSM_PARAM_NAME,
+                      Value=json.dumps(account_map),
+                      Type='String',
+                      Overwrite=True,
+                      Description='Account-to-BillingGroup map for monthly RI/SP chargeback pipeline'
+                  )
+                  logger.info(f"Account map stored in SSM: {SSM_PARAM_NAME}")
+              except ClientError as e:
+                  logger.error(f"Failed to store map in SSM: {str(e)}")
+                  raise
+      Tags:
+        - Key: Project
+          Value: RISP-Chargeback
+
+  # ─────────────────────────────────────────────────────────────────
+  # Lambda Function 2 — Apply RI/SP Credits (with integrated Athena)
+  # ─────────────────────────────────────────────────────────────────
+  ApplyRISPCreditsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'RISPChargeback-ApplyCredits-${AWS::StackName}'
+      Description: >-
+        Runs Athena query to calculate per-account RI/SP savings, then applies
+        proportional credits as Custom Line Items in AWS Billing Conductor.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt ApplyRISPCreditsRole.Arn
+      Environment:
+        Variables:
+          PAYER_ACCOUNT_ID: !Ref PayerAccountId
+          SSM_PARAM_NAME: /chargeback/account-billing-group-map
+          AUDIT_BUCKET: !Ref AuditBucket
+          DRY_RUN: !Ref DryRun
+          ATHENA_DATABASE: !Ref AthenaDatabase
+          ATHENA_TABLE: !Ref AthenaTable
+          ATHENA_OUTPUT_LOCATION: !Sub 's3://risp-chargeback-audit-${AWS::AccountId}-${AWS::Region}/athena-results/'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import os
+          import time
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          PAYER_ACCOUNT_ID       = os.environ['PAYER_ACCOUNT_ID']
+          SSM_PARAM_NAME         = os.environ.get('SSM_PARAM_NAME', '/chargeback/account-billing-group-map')
+          AUDIT_BUCKET           = os.environ['AUDIT_BUCKET']
+          REGION                 = os.environ.get('AWS_REGION', 'us-east-1')
+          DRY_RUN                = os.environ.get('DRY_RUN', 'false').lower() == 'true'
+          ATHENA_DATABASE        = os.environ['ATHENA_DATABASE']
+          ATHENA_TABLE           = os.environ['ATHENA_TABLE']
+          ATHENA_OUTPUT_LOCATION = os.environ['ATHENA_OUTPUT_LOCATION']
+
+
+          def lambda_handler(event, context):
+              """
+              Receives billing_period (YYYY-MM), runs Athena query, applies credits.
+              Event: {"billing_period": "2026-02"}
+              """
+              logger.info(f"Event received: {json.dumps(event)}")
+
+              billing_period = event.get('billing_period')
+              if not billing_period:
+                  raise ValueError("Missing required field: billing_period (format: YYYY-MM)")
+
+              # CUR 2.0 partition format is 'YYYY-MM:' (with trailing colon)
+              billing_period_partition = f"{billing_period}:"
+
+              logger.info(f"Processing billing period: {billing_period} (partition: {billing_period_partition})")
+              if DRY_RUN:
+                  logger.warning("DRY_RUN=true — no Custom Line Items will be created")
+
+              # Step 1: Run Athena query to get per-account savings
+              athena_results = run_athena_savings_query(billing_period_partition)
+              logger.info(f"Athena returned {len(athena_results)} accounts with savings")
+
+              if not athena_results:
+                  return {
+                      "billing_period": billing_period,
+                      "message": "No savings found for this billing period",
+                      "credits_applied": 0
+                  }
+
+              # Step 2: Load account-to-billing-group map from SSM
+              account_map = load_account_map_from_ssm()
+
+              # Step 3: Build billing period range for ABC API
+              billing_period_range = build_billing_period_range(billing_period)
+
+              # Step 4: Apply credits
+              results = apply_credits(athena_results, account_map, billing_period, billing_period_range)
+
+              # Step 5: Validate totals
+              validation = validate_credits(athena_results, results)
+
+              # Step 6: Store audit log
+              store_audit_log(billing_period, athena_results, results, validation)
+
+              # Step 7: Build summary
+              summary = build_summary(results, validation, billing_period)
+              logger.info(f"Pipeline complete: {json.dumps(summary)}")
+              return summary
+
+
+          def run_athena_savings_query(billing_period_partition: str) -> list:
+              """Runs the per-account RI/SP savings query in Athena."""
+              athena = boto3.client('athena', region_name=REGION)
+
+              query = f"""
+              SELECT
+                  line_item_usage_account_id AS account_id,
+                  ROUND(SUM(CASE
+                      WHEN savings_plan_savings_plan_a_r_n <> ''
+                      THEN CAST(pricing_public_on_demand_cost AS double) - CAST(savings_plan_savings_plan_effective_cost AS double)
+                      ELSE 0 END), 4) AS sp_savings_credit,
+                  ROUND(SUM(CASE
+                      WHEN reservation_reservation_a_r_n <> ''
+                      THEN CAST(pricing_public_on_demand_cost AS double) - CAST(reservation_effective_cost AS double)
+                      ELSE 0 END), 4) AS ri_savings_credit,
+                  ROUND(SUM(CASE
+                      WHEN savings_plan_savings_plan_a_r_n <> ''
+                      THEN CAST(pricing_public_on_demand_cost AS double) - CAST(savings_plan_savings_plan_effective_cost AS double)
+                      WHEN reservation_reservation_a_r_n <> ''
+                      THEN CAST(pricing_public_on_demand_cost AS double) - CAST(reservation_effective_cost AS double)
+                      ELSE 0 END), 4) AS total_discount_credit
+              FROM {ATHENA_DATABASE}.{ATHENA_TABLE}
+              WHERE billing_period = '{billing_period_partition}'
+                AND line_item_line_item_type IN ('SavingsPlanCoveredUsage', 'DiscountedUsage')
+              GROUP BY line_item_usage_account_id
+              HAVING SUM(CASE
+                  WHEN savings_plan_savings_plan_a_r_n <> ''
+                  THEN CAST(pricing_public_on_demand_cost AS double) - CAST(savings_plan_savings_plan_effective_cost AS double)
+                  WHEN reservation_reservation_a_r_n <> ''
+                  THEN CAST(pricing_public_on_demand_cost AS double) - CAST(reservation_effective_cost AS double)
+                  ELSE 0 END) > 0
+              ORDER BY total_discount_credit DESC
+              """
+
+              response = athena.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={'Database': ATHENA_DATABASE},
+                  ResultConfiguration={'OutputLocation': ATHENA_OUTPUT_LOCATION}
+              )
+              query_execution_id = response['QueryExecutionId']
+              logger.info(f"Athena query started: {query_execution_id}")
+              return wait_for_query_results(athena, query_execution_id)
+
+
+          def wait_for_query_results(athena, query_execution_id: str, max_wait: int = 300) -> list:
+              """Polls Athena until query completes, then fetches results."""
+              elapsed = 0
+              wait_interval = 3
+              while elapsed < max_wait:
+                  response = athena.get_query_execution(QueryExecutionId=query_execution_id)
+                  state = response['QueryExecution']['Status']['State']
+                  if state == 'SUCCEEDED':
+                      logger.info(f"Athena query completed in ~{elapsed}s")
+                      return fetch_query_results(athena, query_execution_id)
+                  elif state in ('FAILED', 'CANCELLED'):
+                      reason = response['QueryExecution']['Status'].get('StateChangeReason', 'Unknown')
+                      raise RuntimeError(f"Athena query {state}: {reason}")
+                  time.sleep(wait_interval)
+                  elapsed += wait_interval
+              raise TimeoutError(f"Athena query did not complete within {max_wait}s")
+
+
+          def fetch_query_results(athena, query_execution_id: str) -> list:
+              """Fetches all result rows from a completed Athena query."""
+              results = []
+              paginator = athena.get_paginator('get_query_results')
+              for page in paginator.paginate(QueryExecutionId=query_execution_id):
+                  rows = page['ResultSet']['Rows']
+                  for row in rows:
+                      cells = [col.get('VarCharValue', '') for col in row['Data']]
+                      if cells[0] == 'account_id':
+                          continue
+                      if len(cells) >= 4:
+                          results.append({
+                              'account_id': cells[0],
+                              'sp_savings_credit': cells[1],
+                              'ri_savings_credit': cells[2],
+                              'total_discount_credit': cells[3]
+                          })
+              logger.info(f"Fetched {len(results)} rows from Athena results")
+              return results
+
+
+          def load_account_map_from_ssm() -> dict:
+              ssm = boto3.client('ssm', region_name=REGION)
+              try:
+                  response = ssm.get_parameter(Name=SSM_PARAM_NAME)
+                  account_map = json.loads(response['Parameter']['Value'])
+                  logger.info(f"Loaded account map from SSM: {len(account_map)} accounts")
+                  return account_map
+              except ssm.exceptions.ParameterNotFound:
+                  logger.error("SSM param not found — run Lambda 1 first")
+                  return {}
+
+
+          def build_billing_period_range(billing_period: str) -> dict:
+              """Converts 'YYYY-MM' to ABC BillingPeriodRange format."""
+              year, month = billing_period.split('-')
+              year_int, month_int = int(year), int(month)
+              if month_int == 12:
+                  end_year, end_month = year_int + 1, 1
+              else:
+                  end_year, end_month = year_int, month_int + 1
+              return {
+                  'InclusiveStartBillingPeriod': billing_period,
+                  'ExclusiveEndBillingPeriod': f"{end_year}-{str(end_month).zfill(2)}"
+              }
+
+
+          def apply_credits(athena_results, account_map, billing_period, billing_period_range):
+              bc = boto3.client('billingconductor', region_name='us-east-1')
+              results = []
+              for record in athena_results:
+                  account_id = record['account_id']
+                  if account_id == PAYER_ACCOUNT_ID:
+                      results.append(_result(account_id, 'PAYER', 0, 'SKIPPED', 'Payer excluded'))
+                      continue
+                  billing_group_arn = account_map.get(account_id)
+                  if not billing_group_arn:
+                      logger.warning(f"Account {account_id} not in any billing group — skipping")
+                      results.append(_result(account_id, 'UNKNOWN', 0, 'SKIPPED', 'No billing group'))
+                      continue
+                  sp_credit = round(float(record.get('sp_savings_credit') or 0), 4)
+                  ri_credit = round(float(record.get('ri_savings_credit') or 0), 4)
+                  logger.info(f"Account {account_id}: SP=${sp_credit:.4f}, RI=${ri_credit:.4f}")
+                  if sp_credit > 0:
+                      results.append(create_custom_line_item(
+                          bc, account_id, billing_group_arn, billing_period,
+                          billing_period_range, sp_credit, 'SP'))
+                  if ri_credit > 0:
+                      results.append(create_custom_line_item(
+                          bc, account_id, billing_group_arn, billing_period,
+                          billing_period_range, ri_credit, 'RI'))
+                  time.sleep(0.2)
+              return results
+
+
+          def create_custom_line_item(bc, account_id, billing_group_arn, billing_period,
+                                      billing_period_range, credit_amount, credit_type):
+              item_name = f"{credit_type}-Credit-{account_id}-{billing_period}"
+              description = (
+                  f"Proportional {'Savings Plans' if credit_type == 'SP' else 'Reserved Instance'} "
+                  f"discount credit for account {account_id}, period {billing_period}.")
+              if DRY_RUN:
+                  logger.info(f"[DRY RUN] Would create: {item_name} | ${credit_amount:.4f}")
+                  return _result(account_id, credit_type, credit_amount, 'DRY_RUN', item_name)
+              try:
+                  response = bc.create_custom_line_item(
+                      Name=item_name, Description=description,
+                      BillingGroupArn=billing_group_arn,
+                      BillingPeriodRange=billing_period_range,
+                      ChargeDetails={'Flat': {'ChargeValue': credit_amount}, 'Type': 'CREDIT'})
+                  logger.info(f"Created {credit_type} credit for {account_id}: -${credit_amount:.4f}")
+                  return _result(account_id, credit_type, credit_amount, 'SUCCESS', item_name, arn=response['Arn'])
+              except bc.exceptions.ConflictException:
+                  logger.warning(f"Already exists: {item_name}")
+                  return _result(account_id, credit_type, credit_amount, 'ALREADY_EXISTS', item_name)
+              except bc.exceptions.ThrottlingException:
+                  logger.warning(f"Throttled on {item_name} — retrying after 2s")
+                  time.sleep(2)
+                  return create_custom_line_item(bc, account_id, billing_group_arn, billing_period,
+                                                billing_period_range, credit_amount, credit_type)
+              except ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  error_msg = e.response['Error']['Message']
+                  logger.error(f"Failed {item_name}: [{error_code}] {error_msg}")
+                  return _result(account_id, credit_type, credit_amount, 'FAILED', item_name,
+                                 error=f"{error_code}: {error_msg}")
+
+
+          def validate_credits(athena_results, apply_results):
+              total_athena = sum(float(r.get('total_discount_credit') or 0)
+                                for r in athena_results if r['account_id'] != PAYER_ACCOUNT_ID)
+              total_applied = sum(r['amount'] for r in apply_results if r['status'] == 'SUCCESS')
+              delta = abs(total_athena - total_applied)
+              passed = delta <= 1.00
+              return {
+                  'total_athena_savings': round(total_athena, 4),
+                  'total_credits_applied': round(total_applied, 4),
+                  'delta': round(delta, 4),
+                  'passed': passed,
+                  'message': 'Validation passed' if passed else f'Mismatch of ${delta:.2f}'
+              }
+
+
+          def store_audit_log(billing_period, athena_results, results, validation):
+              s3 = boto3.client('s3', region_name=REGION)
+              audit_key = f"chargeback-audit/{billing_period}/apply-credits-results.json"
+              audit_data = {'billing_period': billing_period, 'athena_input': athena_results,
+                            'apply_results': results, 'validation': validation}
+              try:
+                  s3.put_object(Bucket=AUDIT_BUCKET, Key=audit_key,
+                                Body=json.dumps(audit_data, indent=2), ContentType='application/json')
+                  logger.info(f"Audit log stored: s3://{AUDIT_BUCKET}/{audit_key}")
+              except ClientError as e:
+                  logger.error(f"Failed to store audit log: {str(e)}")
+
+
+          def build_summary(results, validation, billing_period):
+              success = [r for r in results if r['status'] == 'SUCCESS']
+              already_exist = [r for r in results if r['status'] == 'ALREADY_EXISTS']
+              skipped = [r for r in results if r['status'] == 'SKIPPED']
+              failed = [r for r in results if r['status'] == 'FAILED']
+              dry_run = [r for r in results if r['status'] == 'DRY_RUN']
+              return {
+                  'billing_period': billing_period, 'dry_run': DRY_RUN,
+                  'credits_applied': len(success), 'already_existed': len(already_exist),
+                  'skipped': len(skipped), 'failed': len(failed),
+                  'dry_run_simulated': len(dry_run),
+                  'total_credits_applied': validation['total_credits_applied'],
+                  'validation': validation, 'failed_details': failed
+              }
+
+
+          def _result(account_id, credit_type, amount, status, name, arn=None, error=None):
+              r = {'account_id': account_id, 'credit_type': credit_type,
+                   'amount': amount, 'status': status, 'name': name}
+              if arn: r['arn'] = arn
+              if error: r['error'] = error
+              return r
+      Tags:
+        - Key: Project
+          Value: RISP-Chargeback
+
+  # ─────────────────────────────────────────────────────────────────
+  # EventBridge Rule — Monthly Schedule (5th of month, 8AM UTC)
+  # ─────────────────────────────────────────────────────────────────
+  MonthlyChargebackSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'RISPChargeback-MonthlyTrigger-${AWS::StackName}'
+      Description: >-
+        Triggers the Billing Group Mapping Lambda on the 5th of each month at 8:00 AM UTC.
+        Disabled by default — set EnableSchedule parameter to true to activate.
+      ScheduleExpression: 'cron(0 8 5 * ? *)'
+      State: !If [ScheduleEnabled, ENABLED, DISABLED]
+      Targets:
+        - Id: BillingGroupMappingTarget
+          Arn: !GetAtt BillingGroupMappingFunction.Arn
+
+  # Permission for EventBridge to invoke Lambda 1
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BillingGroupMappingFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MonthlyChargebackSchedule.Arn
+
+# ═══════════════════════════════════════════════════════════════════
+# Outputs
+# ═══════════════════════════════════════════════════════════════════
+Outputs:
+  BillingGroupMappingFunctionArn:
+    Description: ARN of the Billing Group Mapping Lambda function (Lambda 1)
+    Value: !GetAtt BillingGroupMappingFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BillingGroupMappingFunctionArn'
+
+  ApplyRISPCreditsFunctionArn:
+    Description: ARN of the Apply RI/SP Credits Lambda function (Lambda 2)
+    Value: !GetAtt ApplyRISPCreditsFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplyRISPCreditsFunctionArn'
+
+  AuditBucketName:
+    Description: Name of the S3 bucket used for chargeback audit logs
+    Value: !Ref AuditBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AuditBucketName'
+
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge monthly schedule rule
+    Value: !GetAtt MonthlyChargebackSchedule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeRuleArn'
