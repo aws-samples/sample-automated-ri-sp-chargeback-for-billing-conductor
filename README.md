@@ -105,7 +105,7 @@ aws cloudformation wait stack-create-complete \
 | `AthenaDatabase` | String | `cur2` | Glue database containing your CUR 2.0 table |
 | `AthenaTable` | String | `data` | Table name within the Athena database |
 | `CURBucketName` | String | *(required)* | S3 bucket where CUR 2.0 data is stored |
-| `BillingPeriod` | String | `2026-02:` | Billing period in CUR 2.0 partition format (`YYYY-MM:` with trailing colon) |
+| `BillingPeriod` | String | `2026-02:` | Billing period in CUR 2.0 partition format (`YYYY-MM` with trailing colon) |
 | `DryRun` | String | `true` | Set to `true` for simulation mode — no credits are created |
 | `EnableSchedule` | String | `false` | Set to `true` to enable the monthly EventBridge schedule |
 
