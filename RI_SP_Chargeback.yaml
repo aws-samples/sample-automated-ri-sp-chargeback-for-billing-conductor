@@ -30,9 +30,9 @@ Parameters:
 
   BillingPeriod:
     Type: String
-    Default: '2026-02:'
+    Default: '2026-07'
     Description: >-
-      Billing period value as it appears in CUR 2.0 partition (YYYY-MM: format with colon).
+      Billing period value as it appears in CUR 2.0 partition (YYYY-MM format).
 
   EnableSchedule:
     Type: String
@@ -70,7 +70,37 @@ Conditions:
 # Resources
 # ═══════════════════════════════════════════════════════════════════
 Resources:
-
+  # ─────────────────────────────────────────────────────────────────
+  # S3 Bucket — Access Logs for Audit Bucket
+  # ─────────────────────────────────────────────────────────────────
+  AuditBucketAccessLogs:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'risp-chargeback-audit-logs-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AuditBucketAccessLogs
+        LogFilePrefix: self-access-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogsAfter90Days
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Project
+          Value: RISP-Chargeback
+        - Key: Purpose
+          Value: AccessLogs
   # ─────────────────────────────────────────────────────────────────
   # S3 Bucket — Audit Logs
   # ─────────────────────────────────────────────────────────────────
@@ -82,11 +112,16 @@ Resources:
         ServerSideEncryptionConfiguration:
           - ServerSideEncryptionByDefault:
               SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AuditBucketAccessLogs
+        LogFilePrefix: access-logs/
       LifecycleConfiguration:
         Rules:
           - Id: ExpireAuditLogsAfter365Days
@@ -155,6 +190,11 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: DLQAccess
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt BillingGroupMappingDLQ.Arn
       Tags:
         - Key: Project
           Value: RISP-Chargeback
@@ -183,6 +223,9 @@ Resources:
                 Action:
                   - billingconductor:CreateCustomLineItem
                 Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:PrincipalAccount': !Ref 'AWS::AccountId'
               - Sid: SSMReadAccess
                 Effect: Allow
                 Action:
@@ -204,7 +247,8 @@ Resources:
                   - athena:StartQueryExecution
                   - athena:GetQueryExecution
                   - athena:GetQueryResults
-                Resource: '*'
+                Resource:
+                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/primary'
               - Sid: GlueCatalogAccess
                 Effect: Allow
                 Action:
@@ -223,6 +267,11 @@ Resources:
                 Resource:
                   - !Sub 'arn:aws:s3:::${CURBucketName}'
                   - !Sub 'arn:aws:s3:::${CURBucketName}/*'
+              - Sid: DLQAccess
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt ApplyRISPCreditsDLQ.Arn
               - Sid: CloudWatchLogs
                 Effect: Allow
                 Action:
@@ -230,6 +279,19 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: RISP-Chargeback
+
+  # ─────────────────────────────────────────────────────────────────
+  # SQS Dead Letter Queue for Billing Group Mapping Lambda
+  # ─────────────────────────────────────────────────────────────────
+  BillingGroupMappingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'RISPChargeback-BillingGroupMapping-DLQ-${AWS::StackName}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
       Tags:
         - Key: Project
           Value: RISP-Chargeback
@@ -248,6 +310,9 @@ Resources:
       Handler: index.lambda_handler
       Timeout: 300
       MemorySize: 256
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt BillingGroupMappingDLQ.Arn
       Role: !GetAtt BillingGroupMappingRole.Arn
       Environment:
         Variables:
@@ -332,6 +397,19 @@ Resources:
           Value: RISP-Chargeback
 
   # ─────────────────────────────────────────────────────────────────
+  # SQS Dead Letter Queue for Apply Credits Lambda
+  # ─────────────────────────────────────────────────────────────────
+  ApplyRISPCreditsDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'RISPChargeback-ApplyCredits-DLQ-${AWS::StackName}'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Project
+          Value: RISP-Chargeback
+  
+  # ─────────────────────────────────────────────────────────────────
   # Lambda Function 2 — Apply RI/SP Credits (with integrated Athena)
   # ─────────────────────────────────────────────────────────────────
   ApplyRISPCreditsFunction:
@@ -345,6 +423,9 @@ Resources:
       Handler: index.lambda_handler
       Timeout: 900
       MemorySize: 512
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt ApplyRISPCreditsDLQ.Arn
       Role: !GetAtt ApplyRISPCreditsRole.Arn
       Environment:
         Variables:
@@ -388,8 +469,8 @@ Resources:
               if not billing_period:
                   raise ValueError("Missing required field: billing_period (format: YYYY-MM)")
 
-              # CUR 2.0 partition format is 'YYYY-MM:' (with trailing colon)
-              billing_period_partition = f"{billing_period}:"
+              # CUR 2.0 partition format is 'YYYY-MM'
+              billing_period_partition = f"{billing_period}"
 
               logger.info(f"Processing billing period: {billing_period} (partition: {billing_period_partition})")
               if DRY_RUN:
