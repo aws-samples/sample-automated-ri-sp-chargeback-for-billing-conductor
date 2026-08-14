@@ -88,9 +88,6 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
-      LoggingConfiguration:
-        DestinationBucketName: !Ref AuditBucketAccessLogs
-        LogFilePrefix: self-access-logs/
       LifecycleConfiguration:
         Rules:
           - Id: ExpireAccessLogsAfter90Days
